@@ -1,0 +1,3 @@
+*.neff
+*.ntff
+__pycache__/
