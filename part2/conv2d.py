@@ -74,15 +74,17 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     out_spatial = out_height * out_width
     n_tiles_n = (out_spatial + TILE_N - 1) // TILE_N
 
+    X_reshaped = X.reshape((batch_size, in_channels, input_height * input_width))
+    W_sbuf = nl.ndarray(W.shape, dtype=W.dtype, buffer=nl.sbuf)
+    W_sbuf[...] = nl.load(W)
+
     # Process the images in batches
     for b in nl.affine_range(batch_size):
         # raise RuntimeError("Please fill your implementation of computing convolution"
         #                    " of X[b] with the weights W and bias b, followed by a"
         #                    " maxpool and store the result in X_out[b]")
 
-        X_img = X[b, :, :, :]
-
-        X_flat = X_img.reshape((in_channels, input_height * input_width))
+        X_flat = X_reshaped[b, :, :]
 
         conv_out = nl.zeros(
             shape=(out_channels, out_height, out_width),
@@ -94,7 +96,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         for i in nl.affine_range(filter_height):
             for j in nl.affine_range(filter_width):
                 # Get filter slice at (i,j): shape (out_channels, in_channels)
-                W_slice = W[: , :, i, j]
+                W_slice = W_sbuf[:, :, i, j]
 
                 # Create shifted input aligned with filter position
                 # For each output position (oh, ow), input position is (oh + i, ow + j)
@@ -110,11 +112,14 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         iw = ow + j
                         in_idx = ih * input_width + iw
                         out_idx = oh * out_width + ow
-                        X_shifted[:, out_idx] = nl.copy(X_flat[:, in_idx])
+                        X_shifted[:, out_idx] = nl.load(X_flat[:, in_idx])
 
                 # Matrix multiply: W_slice @ X_shifted
                 # Shape: (out_channels, in_channels) @ (in_channels, out_height*out_width)
                 # Result: (out_channels, out_height*out_width)
+
+                i_k = nl.arange(TILE_K)[:, None]  # For partition dimension (K)
+                i_n = nl.arange(TILE_N)[None, :]  # For free dimension (N)
 
                 for m_tile in nl.affine_range(n_tiles_c_out):
                     for n_tile in nl.affine_range(n_tiles_n):
@@ -130,21 +135,16 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
                         for k_tile in nl.affine_range(n_tiles_c_in):
                             w_tile = nl.ndarray((TILE_M, TILE_K), dtype=W.dtype, buffer=nl.sbuf)
-                            w_tile[...] = nl.load(
-                                W_slice[
+                            w_tile = W_slice[
                                     m_tile * TILE_M : (m_tile + 1) * TILE_M,
                                     k_tile * TILE_K : (k_tile + 1) * TILE_K,
                                 ]
-                            )
 
                             x_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
-                            x_tile[...] = nl.load(
-                                X_shifted[
+                            x_tile = X_shifted[
                                     k_tile * TILE_K : (k_tile + 1) * TILE_K,
                                     n_start : n_end,
                                 ]
-                                mask=(x_tile[:, :n_size] == 1)
-                            )
 
                             psum[:, :n_size] += nl.matmul(w_tile, x_tile[:, :n_size])
 
@@ -158,9 +158,17 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                                 ow = global_n % out_width
                                 conv_out[global_m, oh, ow] += result[m_idx, n_idx]
 
-        # Add bias
+        # Probably want to replace this with fully vectorized tensor_tensor elementwise add
+        conv_out_flat = conv_out.reshape((out_channels, out_height * out_width))
+
         for c in nl.affine_range(out_channels):
-            conv_out[c, :, :] += bias[c]
+            conv_out_flat[c, :] += bias[c]
+
+        conv_out = conv_out_flat.reshape((out_channels, out_height, out_width))
+
+        # Add bias
+        # for c in nl.affine_range(out_channels):
+        #     conv_out[c, :, :] += bias[c]
 
         # Maxpooling
         if pool_size == 1:
