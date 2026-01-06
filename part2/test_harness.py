@@ -80,9 +80,11 @@ def test_correctness_conv2d_kernel(
                         )
 
                         args = [X, W, bias]
+                        print(f"Debug shapes: {X.shape}, {W.shape}, {bias.shape}")
                         kwargs = {"pool_size": pool_size}
 
                         out = kernel(*args, **kwargs)
+                        print(f"Output shape: {out.shape}")
                         out_ref = ref_impl(*args, **kwargs)
 
                         if not np.allclose(out, out_ref):
