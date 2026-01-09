@@ -90,15 +90,9 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
         X_flat = X_reshaped[b, :, :]
 
-        # Can only allocate one tile of output in SBUF at a time since out_channels may be > 128
-        # Allocate full output in HBM for now until optimizing for tiled approach in SBUF
-        # conv_out = nl.zeros(
-        #     shape=(out_channels, out_height * out_width),
-        #     dtype=X.dtype,
-        #     buffer=nl.sbuf,
-        # )
+        # Initialize conv_out buffer to hold convolution results before pooling
         conv_out = nl.zeros(
-            shape=(n_tiles_c_out, nl.par_dim(TILE_M), out_height * out_width),
+            shape=(TILE_M, n_tiles_c_out, out_height * out_width), 
             dtype=X.dtype,
             buffer=nl.sbuf,
         )
@@ -108,45 +102,16 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             for j in nl.sequential_range(filter_width):
                 filter_index = i * filter_width + j
 
-                # Create shifted input aligned with filter position
-                # For each output position (oh, ow), input position is (oh + i, ow + j)
-                # Note: same issue as with out_channels -- in_channels may be > 128
-                # X_shifted = nl.ndarray(
-                #     shape=(in_channels, out_height * out_width),
-                #     dtype=X.dtype,
-                #     buffer=nl.sbuf,
-                # )
-                X_shifted_tiles = nl.ndarray(
-                    shape=(n_tiles_c_in, nl.par_dim(TILE_K), out_height * out_width),
-                    dtype=X.dtype,
-                    buffer=nl.sbuf,
-                )
-
-                # Load all input channel tiles for this filter position
-                for k_tile in nl.affine_range(n_tiles_c_in):
-                    k_start = k_tile * TILE_K
-                    k_end = (k_tile + 1) * TILE_K
-
-                    for oh in nl.affine_range(out_height):
-                        for ow in nl.affine_range(out_width):
-                            ih = oh + i
-                            iw = ow + j
-                            in_idx = ih * input_width + iw
-                            out_idx = oh * out_width + ow
-                            # load one channel tile at a time
-                            X_shifted_tiles[k_tile, :, out_idx] = nl.load(X_flat[k_start:k_end, in_idx])
-
-                # Now perform tiled matrix multiplication
+                # Perform tiled matrix multiplication
                 # Iterate over output channel tiles
                 for m_tile in nl.affine_range(n_tiles_c_out):
                     m_start = m_tile * TILE_M
-                    # m_end = min((m_tile + 1) * TILE_M, out_channels)
                     m_end = (m_tile + 1) * TILE_M
 
                     # Load weight tiles for this output channel tile across all input channels
-                    # Shape: (n_tiles_c_in, TILE_M, TILE_K)
+                    # Shape: (TILE_M, TILE_K, n_tiles_c_in, filter_height * filter_width)
                     W_tiles = nl.ndarray(
-                        shape=(n_tiles_c_in, nl.par_dim(TILE_M), TILE_K, filter_height * filter_width),
+                        shape=(TILE_M, TILE_K, n_tiles_c_in, filter_height * filter_width),
                         dtype=W.dtype,
                         buffer=nl.sbuf,
                     )
@@ -156,7 +121,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         k_end = (k_tile + 1) * TILE_K
 
                         # Load weight tile: out_channels[m_start:m_end] x in_channels[k_start:k_end]
-                        W_tiles[k_tile, :, :, :] = nl.load(
+                        W_tiles[:, :, k_tile, :] = nl.load(
                             W_reshaped[m_start:m_end, k_start:k_end, :]
                         )
 
@@ -172,28 +137,36 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         )
 
                         for k_tile in nl.affine_range(n_tiles_c_in):
+                            # Load X_shifted tile for this k_tile
+                            X_shifted_tile = nl.ndarray(
+                                shape=(TILE_K, out_height * out_width),
+                                dtype=X.dtype,
+                                buffer=nl.sbuf,
+                            )
+
+                            k_start = k_tile * TILE_K
+                            k_end = (k_tile + 1) * TILE_K
+
+                            # Create shifted input aligned with filter position
+                            # For each output position (oh, ow), input position is (oh + i, ow + j)
+                            for oh in nl.affine_range(out_height):
+                                for ow in nl.affine_range(out_width):
+                                    ih = oh + i
+                                    iw = ow + j
+                                    in_idx = ih * input_width + iw
+                                    out_idx = oh * out_width + ow
+                                    # load one channel tile at a time
+                                    X_shifted_tile[:, out_idx] = nl.load(X_flat[k_start:k_end, in_idx])
 
                             i_rhs_f = nl.arange(TILE_N)[None, :]
                             res_psum += nl.matmul(
-                                W_tiles[k_tile, i_w.p, i_w.x, filter_index],
-                                X_shifted_tiles[k_tile, i_x.p, i_x.x][i_rhs_f < n_size],
+                                W_tiles[i_w.p, i_w.x, k_tile, filter_index],
+                                X_shifted_tile[i_x.p, i_x.x][i_rhs_f < n_size],
                             )
-                            # k_start = k_tile * TILE_K
-                            # k_end = (k_tile + 1) * TILE_K
-
-                            # filter_index = i * filter_width + j
-
-                            # w_tile = nl.ndarray((TILE_M, TILE_K, filter_height * filter_width), dtype=W.dtype, buffer=nl.sbuf)
-                            # w_tile[:m_size, :, :] = nl.load(W_reshaped[m_start:m_end, k_start:k_end, :])
-
-                            # x_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
-                            # x_tile[:, :n_size] = X_shifted[k_start:k_end, n_start:n_end]
-
-                            # res_psum[:m_size, :n_size] += nl.matmul(w_tile[:m_size, :, filter_index], x_tile[:, :n_size])
 
                         result_sbuf = nl.copy(res_psum, dtype=X.dtype)
-                        conv_out[m_tile, i_res.p, n_start + i_res.x] = nl.add(
-                            conv_out[m_tile, i_res.p, n_start + i_res.x],
+                        conv_out[i_res.p, m_tile, n_start + i_res.x] = nl.add(
+                            conv_out[i_res.p, m_tile, n_start + i_res.x],
                             result_sbuf[i_res.p, i_res.x],
                             mask=(n_start + i_res.x < out_spatial)
                         )
@@ -214,7 +187,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     dtype=X.dtype,
                     buffer=nl.sbuf,
                 )
-                conv_out_tile_flat[:, :] = conv_out[m_tile, :, :]
+                conv_out_tile_flat[:, :] = conv_out[:, m_tile, :]
                 conv_out_tile_spatial = conv_out_tile_flat.reshape((TILE_M, out_height, out_width))
                 
                 # Store directly to HBM
@@ -232,7 +205,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     dtype=X.dtype,
                     buffer=nl.sbuf,
                 )
-                conv_out_tile_flat[:, :] = conv_out[m_tile, :, :]
+                conv_out_tile_flat[:, :] = conv_out[:, m_tile, :]
                 conv_out_tile_spatial = conv_out_tile_flat.reshape((TILE_M, out_height, out_width))
                 
                 # Perform maxpooling on this tile
