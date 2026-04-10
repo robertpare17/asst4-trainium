@@ -69,20 +69,16 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     n_tiles_c_out = out_channels // TILE_M
 
     # Compile-time spatial tiling.
-    # ROW_TILE: number of output rows per spatial tile, chosen so
-    # N_SPATIAL = ROW_TILE * out_width <= TILE_N and out_height % ROW_TILE == 0.
     if out_height * out_width <= TILE_N:
-        ROW_TILE = out_height           # everything fits in one tile
+        ROW_TILE = out_height
     else:
-        ROW_TILE = TILE_N // out_width  # max rows per tile
+        ROW_TILE = TILE_N // out_width
         if out_height % ROW_TILE != 0:
-            ROW_TILE = 1                # safe fallback
+            ROW_TILE = 1
 
-    N_SPATIAL   = ROW_TILE * out_width   # compile-time constant, <= TILE_N
+    N_SPATIAL   = ROW_TILE * out_width
     n_row_tiles = out_height // ROW_TILE
-
-    # STRIP_ROWS: input rows needed to cover one output row-tile at all filter offsets.
-    STRIP_ROWS = ROW_TILE + filter_height - 1
+    STRIP_ROWS  = ROW_TILE + filter_height - 1
 
     X_reshaped = X.reshape((batch_size, in_channels, input_height * input_width))
     W_reshaped = W.reshape((out_channels, in_channels, filter_height * filter_width))
@@ -90,6 +86,34 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     i_w   = nl.mgrid[0:TILE_M, 0:TILE_K]
     i_x   = nl.mgrid[0:TILE_K, 0:N_SPATIAL]
     i_row = nl.mgrid[0:TILE_M, 0:out_width]
+
+    # ================================================================
+    # TOP-LEVEL weight preload (outside all affine_range loops).
+    # Python range() here gives plain Python ints, not LoopVars.
+    # W and bias don't depend on the batch index, so loading once is correct.
+    # For n_tiles_c_out=2 (the benchmark case) both wt_0 and wt_1 are loaded
+    # into SBUF and reused across every row_tile and every batch element.
+    # ================================================================
+    wt_0 = nl.ndarray(
+        shape=(TILE_M, TILE_K, n_tiles_c_in, filter_height * filter_width),
+        dtype=W.dtype,
+        buffer=nl.sbuf,
+    )
+    for k_tile in nl.affine_range(n_tiles_c_in):
+        k_s = k_tile * TILE_K
+        wt_0[:, :, k_tile, :] = nl.load(W_reshaped[0:TILE_M, k_s:k_s + TILE_K, :])
+    bt_0 = nl.load(bias[0:TILE_M])
+
+    if n_tiles_c_out >= 2:
+        wt_1 = nl.ndarray(
+            shape=(TILE_M, TILE_K, n_tiles_c_in, filter_height * filter_width),
+            dtype=W.dtype,
+            buffer=nl.sbuf,
+        )
+        for k_tile in nl.affine_range(n_tiles_c_in):
+            k_s = k_tile * TILE_K
+            wt_1[:, :, k_tile, :] = nl.load(W_reshaped[TILE_M:2 * TILE_M, k_s:k_s + TILE_K, :])
+        bt_1 = nl.load(bias[TILE_M:2 * TILE_M])
 
     for b in nl.affine_range(batch_size):
         X_flat = X_reshaped[b, :, :]
@@ -101,133 +125,118 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 buffer=nl.hbm,
             )
 
-        # ---- Preload ALL weights and biases ONCE (shared across all row_tiles) ----
-        # Python range (compile-time unrolling) → static Python list indexing later.
-        W_tiles_by_m = []
-        bias_by_m    = []
-        for m in range(n_tiles_c_out):
-            m_s = m * TILE_M
-            wt = nl.ndarray(
-                shape=(TILE_M, TILE_K, n_tiles_c_in, filter_height * filter_width),
-                dtype=W.dtype,
-                buffer=nl.sbuf,
-            )
-            for k in range(n_tiles_c_in):
-                k_s = k * TILE_K
-                wt[:, :, k, :] = nl.load(W_reshaped[m_s:m_s + TILE_M, k_s:k_s + TILE_K, :])
-            W_tiles_by_m.append(wt)
-            bias_by_m.append(nl.load(bias[m_s:m_s + TILE_M]))
-
         for row_tile in nl.affine_range(n_row_tiles):
             oh_start = row_tile * ROW_TILE
 
-            # ---- Load input strips for ALL k_tiles ONCE per row_tile ----
-            # nl.par_dim(TILE_K) marks TILE_K=128 as the partition dimension.
-            # First dim (n_tiles_c_in) is a batch dim indexed with Python int below.
-            strips = nl.ndarray(
-                shape=(n_tiles_c_in, nl.par_dim(TILE_K), STRIP_ROWS * input_width),
-                dtype=X.dtype,
-                buffer=nl.sbuf,
+            # One PSUM per output-channel tile.  Both are alive simultaneously,
+            # accumulating contributions from every (k_tile, i, j).  X_tile is
+            # built ONCE per (k_tile, i, j) and shared by both matmuls — halving
+            # the SBUF copy work vs the m_tile-outer structure.
+            psum_0 = nl.zeros(
+                shape=(TILE_M, N_SPATIAL), dtype=nl.float32, buffer=nl.psum
             )
+            if n_tiles_c_out >= 2:
+                psum_1 = nl.zeros(
+                    shape=(TILE_M, N_SPATIAL), dtype=nl.float32, buffer=nl.psum
+                )
+
             for k_tile in nl.affine_range(n_tiles_c_in):
-                k_s = k_tile * TILE_K
+                k_start = k_tile * TILE_K
+                k_end   = (k_tile + 1) * TILE_K
+
+                # Load STRIP_ROWS input rows as separate DMA transactions so the
+                # compiler can pipeline them with each other and with compute.
+                strip = nl.ndarray(
+                    shape=(TILE_K, STRIP_ROWS * input_width),
+                    dtype=X.dtype,
+                    buffer=nl.sbuf,
+                )
                 for sr in nl.affine_range(STRIP_ROWS):
                     ih = oh_start + sr
-                    strips[k_tile, :, sr * input_width:(sr + 1) * input_width] = nl.load(
-                        X_flat[k_s:k_s + TILE_K, ih * input_width:(ih + 1) * input_width]
+                    strip[:, sr * input_width:(sr + 1) * input_width] = nl.load(
+                        X_flat[k_start:k_end, ih * input_width:(ih + 1) * input_width]
                     )
 
-            # ---- Precompute X_tiles for ALL (k, fh, fw) combinations ----
-            # Python range loops (compile-time) → k is a Python int, so strips[k, ...] works.
-            # Each X_tile: (TILE_K, N_SPATIAL). Total: n_tiles_c_in*filter_h*filter_w tiles.
-            # These are reused by ALL m_tiles, amortizing the SBUF copies across m_tiles.
-            X_tiles_flat = []
-            for k in range(n_tiles_c_in):
-                for fh in range(filter_height):
-                    for fw in range(filter_width):
+                for i in nl.sequential_range(filter_height):
+                    for j in nl.sequential_range(filter_width):
+                        filter_idx = i * filter_width + j
+
+                        # Build X_tile once; reuse for all m_tiles.
                         X_tile = nl.ndarray(
                             shape=(TILE_K, N_SPATIAL),
                             dtype=X.dtype,
                             buffer=nl.sbuf,
                         )
                         for local_oh in nl.affine_range(ROW_TILE):
-                            sc = (local_oh + fh) * input_width + fw
+                            sc = (local_oh + i) * input_width + j
                             dc = local_oh * out_width
-                            # strips[k, ...] uses Python int k → static slice selection
-                            X_tile[:, dc:dc + out_width] = strips[k, :, sc:sc + out_width]
-                        X_tiles_flat.append(X_tile)
+                            X_tile[:, dc:dc + out_width] = strip[:, sc:sc + out_width]
 
-            # ---- Compute output for each m_tile using preloaded X_tiles ----
-            for m in range(n_tiles_c_out):
-                m_s = m * TILE_M
-                wt  = W_tiles_by_m[m]
-                bt  = bias_by_m[m]
-
-                # Single PSUM accumulates ALL (k, fh, fw) matmuls — one nl.copy at the end.
-                psum = nl.zeros(
-                    shape=(TILE_M, N_SPATIAL),
-                    dtype=nl.float32,
-                    buffer=nl.psum,
-                )
-                tile_idx = 0
-                for k in range(n_tiles_c_in):
-                    for fh in range(filter_height):
-                        for fw in range(filter_width):
-                            filter_idx = fh * filter_width + fw
-                            psum += nl.matmul(
-                                wt[i_w.p, i_w.x, k, filter_idx],
-                                X_tiles_flat[tile_idx][i_x.p, i_x.x],
+                        psum_0 += nl.matmul(
+                            wt_0[i_w.p, i_w.x, k_tile, filter_idx],
+                            X_tile[i_x.p, i_x.x],
+                        )
+                        if n_tiles_c_out >= 2:
+                            psum_1 += nl.matmul(
+                                wt_1[i_w.p, i_w.x, k_tile, filter_idx],
+                                X_tile[i_x.p, i_x.x],
                             )
-                            tile_idx += 1
 
-                result = nl.copy(psum, dtype=X.dtype)
+            # ---- Store results for m_tile = 0 ----
+            result_0 = nl.copy(psum_0, dtype=X.dtype)
+            for local_oh in nl.affine_range(ROW_TILE):
+                src_col   = local_oh * out_width
+                global_oh = oh_start + local_oh
+                row_buf   = nl.ndarray(
+                    shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf
+                )
+                row_buf[i_row.p, i_row.x] = result_0[i_row.p, src_col + i_row.x]
+                row_with_bias = nl.add(row_buf, bt_0)
+                if pool_size == 1:
+                    nl.store(X_out[b, 0:TILE_M, global_oh, :], value=row_with_bias)
+                else:
+                    nl.store(conv_hbm[0:TILE_M, global_oh, :], value=row_with_bias)
 
+            # ---- Store results for m_tile = 1 ----
+            if n_tiles_c_out >= 2:
+                result_1 = nl.copy(psum_1, dtype=X.dtype)
                 for local_oh in nl.affine_range(ROW_TILE):
                     src_col   = local_oh * out_width
                     global_oh = oh_start + local_oh
-
-                    row_buf = nl.ndarray(
-                        shape=(TILE_M, out_width),
-                        dtype=X.dtype,
-                        buffer=nl.sbuf,
+                    row_buf   = nl.ndarray(
+                        shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf
                     )
-                    row_buf[i_row.p, i_row.x] = result[i_row.p, src_col + i_row.x]
-                    row_with_bias = nl.add(row_buf, bt)
-
+                    row_buf[i_row.p, i_row.x] = result_1[i_row.p, src_col + i_row.x]
+                    row_with_bias = nl.add(row_buf, bt_1)
                     if pool_size == 1:
-                        nl.store(X_out[b, m_s:m_s + TILE_M, global_oh, :], value=row_with_bias)
+                        nl.store(X_out[b, TILE_M:2 * TILE_M, global_oh, :], value=row_with_bias)
                     else:
-                        nl.store(conv_hbm[m_s:m_s + TILE_M, global_oh, :], value=row_with_bias)
+                        nl.store(conv_hbm[TILE_M:2 * TILE_M, global_oh, :], value=row_with_bias)
 
         # ---- MaxPool phase (pool_size > 1 only) ----
-        # Load full rows from conv_hbm to amortize HBM traffic across the spatial width.
-        # For each output pool row ph:  load input rows h0=2*ph and h1=2*ph+1,
-        # take element-wise max, then reduce adjacent column pairs.
         if pool_size > 1:
-            i_pool_row = nl.mgrid[0:TILE_M, 0:out_width]
-            i_pool_out = nl.mgrid[0:TILE_M, 0:out_pool_width]
+            i_pw = nl.mgrid[0:TILE_M, 0:out_pool_width]
 
             for m_tile in nl.affine_range(n_tiles_c_out):
-                m_s = m_tile * TILE_M
+                m_start = m_tile * TILE_M
+                m_end   = (m_tile + 1) * TILE_M
+
                 for ph in nl.affine_range(out_pool_height):
                     h0 = ph * 2
                     h1 = ph * 2 + 1
 
-                    # Load two full conv rows: shape (TILE_M, out_width)
-                    row0 = nl.load(conv_hbm[m_s:m_s + TILE_M, h0, :])
-                    row1 = nl.load(conv_hbm[m_s:m_s + TILE_M, h1, :])
+                    row0 = nl.load(conv_hbm[m_start:m_end, h0, :])
+                    row1 = nl.load(conv_hbm[m_start:m_end, h1, :])
 
-                    # Element-wise max across the two rows
                     row_max = nl.maximum(row0, row1)
 
-                    # Reduce adjacent column pairs: out_pool_width = out_width // 2
                     even_cols = nl.ndarray(shape=(TILE_M, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
                     odd_cols  = nl.ndarray(shape=(TILE_M, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
                     for pw in nl.affine_range(out_pool_width):
-                        even_cols[i_pool_out.p, pw] = row_max[i_pool_out.p, pw * 2]
-                        odd_cols[i_pool_out.p, pw]  = row_max[i_pool_out.p, pw * 2 + 1]
+                        even_cols[i_pw.p, pw] = row_max[i_pw.p, pw * 2]
+                        odd_cols[i_pw.p, pw]  = row_max[i_pw.p, pw * 2 + 1]
 
                     pooled = nl.maximum(even_cols, odd_cols)
-                    nl.store(X_out[b, m_s:m_s + TILE_M, ph, :], value=pooled)
+                    nl.store(X_out[b, m_start:m_end, ph, :], value=pooled)
 
     return X_out
