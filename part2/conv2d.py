@@ -87,6 +87,13 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     i_x   = nl.mgrid[0:TILE_K, 0:N_SPATIAL]
     i_row = nl.mgrid[0:TILE_M, 0:out_width]
 
+    # Fused maxpool: pool directly from SBUF instead of writing to HBM first.
+    # Requires ROW_TILE divisible by pool_size (always true for our test cases).
+    use_fused_pool = pool_size > 1 and ROW_TILE % pool_size == 0
+    if use_fused_pool:
+        n_pool_per_tile = ROW_TILE // pool_size
+        i_pool = nl.mgrid[0:TILE_M, 0:out_pool_width]
+
     # ================================================================
     # TOP-LEVEL weight preload (outside all affine_range loops).
     # Python range() here gives plain Python ints, not LoopVars.
@@ -118,7 +125,8 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     for b in nl.affine_range(batch_size):
         X_flat = X_reshaped[b, :, :]
 
-        if pool_size > 1:
+        # Fallback: only allocate conv_hbm when fused pool is not possible.
+        if pool_size > 1 and not use_fused_pool:
             conv_hbm = nl.ndarray(
                 shape=(out_channels, out_height, out_width),
                 dtype=X.dtype,
@@ -157,8 +165,8 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         X_flat[k_start:k_end, ih * input_width:(ih + 1) * input_width]
                     )
 
-                for i in nl.sequential_range(filter_height):
-                    for j in nl.sequential_range(filter_width):
+                for i in nl.affine_range(filter_height):
+                    for j in nl.affine_range(filter_width):
                         filter_idx = i * filter_width + j
 
                         # Build X_tile once; reuse for all m_tiles.
@@ -184,37 +192,87 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
             # ---- Store results for m_tile = 0 ----
             result_0 = nl.copy(psum_0, dtype=X.dtype)
-            for local_oh in nl.affine_range(ROW_TILE):
-                src_col   = local_oh * out_width
-                global_oh = oh_start + local_oh
-                row_buf   = nl.ndarray(
-                    shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf
-                )
-                row_buf[i_row.p, i_row.x] = result_0[i_row.p, src_col + i_row.x]
-                row_with_bias = nl.add(row_buf, bt_0)
-                if pool_size == 1:
-                    nl.store(X_out[b, 0:TILE_M, global_oh, :], value=row_with_bias)
-                else:
-                    nl.store(conv_hbm[0:TILE_M, global_oh, :], value=row_with_bias)
-
-            # ---- Store results for m_tile = 1 ----
-            if n_tiles_c_out >= 2:
-                result_1 = nl.copy(psum_1, dtype=X.dtype)
+            if not use_fused_pool:
                 for local_oh in nl.affine_range(ROW_TILE):
                     src_col   = local_oh * out_width
                     global_oh = oh_start + local_oh
                     row_buf   = nl.ndarray(
                         shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf
                     )
-                    row_buf[i_row.p, i_row.x] = result_1[i_row.p, src_col + i_row.x]
-                    row_with_bias = nl.add(row_buf, bt_1)
+                    row_buf[i_row.p, i_row.x] = result_0[i_row.p, src_col + i_row.x]
+                    row_with_bias = nl.add(row_buf, bt_0)
                     if pool_size == 1:
-                        nl.store(X_out[b, TILE_M:2 * TILE_M, global_oh, :], value=row_with_bias)
+                        nl.store(X_out[b, 0:TILE_M, global_oh, :], value=row_with_bias)
                     else:
-                        nl.store(conv_hbm[TILE_M:2 * TILE_M, global_oh, :], value=row_with_bias)
+                        nl.store(conv_hbm[0:TILE_M, global_oh, :], value=row_with_bias)
+            else:
+                # Fused 2D maxpool: pool pairs of rows directly from SBUF result.
+                for pair in nl.affine_range(n_pool_per_tile):
+                    src_0 = pair * pool_size * out_width
+                    src_1 = (pair * pool_size + 1) * out_width
 
-        # ---- MaxPool phase (pool_size > 1 only) ----
-        if pool_size > 1:
+                    row_buf_0 = nl.ndarray(shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf)
+                    row_buf_0[i_row.p, i_row.x] = result_0[i_row.p, src_0 + i_row.x]
+                    row_0 = nl.add(row_buf_0, bt_0)
+
+                    row_buf_1 = nl.ndarray(shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf)
+                    row_buf_1[i_row.p, i_row.x] = result_0[i_row.p, src_1 + i_row.x]
+                    row_1 = nl.add(row_buf_1, bt_0)
+
+                    row_maxed = nl.maximum(row_0, row_1)
+
+                    # Stride-2 gather for even/odd column pooling — single tensor op.
+                    col_even = nl.ndarray(shape=(TILE_M, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
+                    col_odd  = nl.ndarray(shape=(TILE_M, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
+                    col_even[i_pool.p, i_pool.x] = row_maxed[i_pool.p, i_pool.x * 2]
+                    col_odd[i_pool.p, i_pool.x]  = row_maxed[i_pool.p, i_pool.x * 2 + 1]
+                    pooled = nl.maximum(col_even, col_odd)
+
+                    ph = row_tile * n_pool_per_tile + pair
+                    nl.store(X_out[b, 0:TILE_M, ph, :], value=pooled)
+
+            # ---- Store results for m_tile = 1 ----
+            if n_tiles_c_out >= 2:
+                result_1 = nl.copy(psum_1, dtype=X.dtype)
+                if not use_fused_pool:
+                    for local_oh in nl.affine_range(ROW_TILE):
+                        src_col   = local_oh * out_width
+                        global_oh = oh_start + local_oh
+                        row_buf   = nl.ndarray(
+                            shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf
+                        )
+                        row_buf[i_row.p, i_row.x] = result_1[i_row.p, src_col + i_row.x]
+                        row_with_bias = nl.add(row_buf, bt_1)
+                        if pool_size == 1:
+                            nl.store(X_out[b, TILE_M:2 * TILE_M, global_oh, :], value=row_with_bias)
+                        else:
+                            nl.store(conv_hbm[TILE_M:2 * TILE_M, global_oh, :], value=row_with_bias)
+                else:
+                    for pair in nl.affine_range(n_pool_per_tile):
+                        src_0 = pair * pool_size * out_width
+                        src_1 = (pair * pool_size + 1) * out_width
+
+                        row_buf_0 = nl.ndarray(shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf)
+                        row_buf_0[i_row.p, i_row.x] = result_1[i_row.p, src_0 + i_row.x]
+                        row_0 = nl.add(row_buf_0, bt_1)
+
+                        row_buf_1 = nl.ndarray(shape=(TILE_M, out_width), dtype=X.dtype, buffer=nl.sbuf)
+                        row_buf_1[i_row.p, i_row.x] = result_1[i_row.p, src_1 + i_row.x]
+                        row_1 = nl.add(row_buf_1, bt_1)
+
+                        row_maxed = nl.maximum(row_0, row_1)
+
+                        col_even = nl.ndarray(shape=(TILE_M, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
+                        col_odd  = nl.ndarray(shape=(TILE_M, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
+                        col_even[i_pool.p, i_pool.x] = row_maxed[i_pool.p, i_pool.x * 2]
+                        col_odd[i_pool.p, i_pool.x]  = row_maxed[i_pool.p, i_pool.x * 2 + 1]
+                        pooled = nl.maximum(col_even, col_odd)
+
+                        ph = row_tile * n_pool_per_tile + pair
+                        nl.store(X_out[b, TILE_M:2 * TILE_M, ph, :], value=pooled)
+
+        # ---- Fallback MaxPool phase (only when fused pool not used) ----
+        if pool_size > 1 and not use_fused_pool:
             i_pw = nl.mgrid[0:TILE_M, 0:out_pool_width]
 
             for m_tile in nl.affine_range(n_tiles_c_out):

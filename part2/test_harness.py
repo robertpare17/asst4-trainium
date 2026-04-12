@@ -52,8 +52,6 @@ def test_correctness_conv2d_kernel(
 
     input_channels_list = [128, 256]
     output_channels_list = [128, 256]
-    # input_channels_list = [128]
-    # output_channels_list = [128]
     kernel_size_list = [3]
     batch_size_list = [4]
     image_dims_list = [(32, 16)]
@@ -82,15 +80,10 @@ def test_correctness_conv2d_kernel(
                         )
 
                         args = [X, W, bias]
-                        print(f"Debug shapes: {X.shape}, {W.shape}, {bias.shape}")
                         kwargs = {"pool_size": pool_size}
 
                         out = kernel(*args, **kwargs)
-                        print(f"Output shape: {out.shape}")
-                        # print(out[0, 0, :, :])
                         out_ref = ref_impl(*args, **kwargs)
-                        # print(out_ref[0, 0, :, :])
-                        print(f"Reference output shape: {out_ref.shape}")
 
                         if not np.allclose(out, out_ref):
                             print(
@@ -190,7 +183,6 @@ if __name__ == "__main__":
         flush=True,
     )
     test_result = test_correctness_conv2d_kernel(conv2d, use_larger_images=False)
-    print(f"Debug: test_result = {test_result}")
     if test_result:
         print("Passed 😎")
     else:
